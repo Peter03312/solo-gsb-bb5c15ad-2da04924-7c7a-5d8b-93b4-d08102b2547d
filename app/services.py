@@ -11,11 +11,19 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.actuals import ActualEvent, ActualsReplayError, replay as replay_actuals
+from app.forecast import (
+    ActiveJob,
+    Downtime,
+    InfeasibleForecast,
+    PendingJob,
+    solve_forecast,
+)
 from app.schemas import (
     ActualEventCorrectionIn,
     ActualEventRegisterIn,
     ManifestIn,
     PlanConfirmIn,
+    RemainingForecastIn,
     RestowCreateIn,
     ScheduleCreateIn,
     SlotDataIn,
@@ -2314,6 +2322,222 @@ def utc_iso(dt) -> str | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc).isoformat()
     return dt.astimezone(timezone.utc).isoformat()
+
+
+# ---------- 岸桥停机：剩余作业预测（只读，不落库） ----------
+
+
+def predict_remaining_loading(
+    db: Session,
+    plan_id: str,
+    payload: RemainingForecastIn,
+) -> dict:
+    """按已确认方案的装船实绩与冻结基线，在岸桥停机下预测全部未完箱的剩余作业。
+
+    纯只读计算：不改原排程、实绩与冻结基线。箱项（进行中 + 待开工）须恰好
+    覆盖截至分钟的全部未完箱；实绩事件不得晚于截至分钟。无可行安排返回 422
+    （中文原因）且不保存；方案已取代/版本过期/无实绩返回 409/404。
+    """
+    plan = get_plan(db, plan_id)
+    plan_items = {i.container_no: i for i in plan.items}
+
+    actuals = db.scalar(
+        select(models.LoadingActuals).where(models.LoadingActuals.plan_id == plan_id)
+    )
+    if actuals is None:
+        raise BusinessError(f"方案 {plan_id} 尚无装船实绩登记，无法预测剩余作业", 404)
+    if plan.status == "superseded":
+        raise ConflictError(
+            "方案修订已被新修订取代，其装船实绩已冻结为只读，不再受理剩余作业预测"
+        )
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，仅已确认方案可预测剩余装船作业"
+        )
+    if payload.expected_actual_version != actuals.version:
+        raise ConflictError(
+            f"期望实绩版本 {payload.expected_actual_version} 已过期：当前版本为 "
+            f"{actuals.version}，请基于最新实绩重新提交"
+        )
+
+    cutoff = payload.cutoff_minute
+    crane_count = actuals.baseline_crane_count
+
+    # 按当前生效事件重放全部实绩，确定截至分钟的箱状态
+    events = [
+        ActualEvent(
+            seq=e.seq, event_type=e.event_type, container_no=e.container_no,
+            crane_no=e.crane_no, minute=e.minute, arrival_id=e.id,
+        )
+        for e in sorted(actuals.events, key=lambda x: x.id)
+    ]
+    plan_item_tuples = [
+        (i.container_no, i.stack, i.tier) for i in plan.items
+    ]
+    try:
+        replay_result = replay_actuals(events, plan_item_tuples, crane_count)
+    except ActualsReplayError as exc:  # 已登记事件必然合法；防御性兜底
+        raise BusinessError(f"已登记实绩重放失败：{exc.reason}", 422)
+    boxes = replay_result["boxes"]
+
+    # 实绩事件不得晚于截至分钟
+    late_events = sorted(
+        (e for e in events if e.minute > cutoff), key=lambda e: (e.minute, e.seq)
+    )
+    if late_events:
+        detail = ", ".join(
+            f"流水号 {e.seq}（箱 {e.container_no} {e.event_type} 第 {e.minute} 分钟）"
+            for e in late_events[:10]
+        )
+        raise BusinessError(
+            f"存在 {len(late_events)} 条实绩事件晚于截至分钟 {cutoff}：{detail}；"
+            "请核对截至分钟或先更正/处理晚到事件，本次预测被拒绝",
+            422,
+            extra={
+                "cutoff_minute": cutoff,
+                "events_after_cutoff": [
+                    {"seq": e.seq, "event_type": e.event_type,
+                     "container_no": e.container_no, "crane_no": e.crane_no,
+                     "minute": e.minute}
+                    for e in late_events
+                ],
+            },
+        )
+
+    finished_finish = {
+        no: b.finish_minute
+        for no, b in boxes.items() if b.status == "finished"
+    }
+    in_progress_nos = sorted(
+        no for no, b in boxes.items() if b.status == "in_progress"
+    )
+    pending_nos = sorted(no for no, b in boxes.items() if b.status == "pending")
+
+    active_in = {e.container_no: e for e in payload.in_progress}
+    pending_in = {e.container_no: e for e in payload.pending}
+
+    # 箱项合法性：不得有方案外箱；两组须与截至时刻的实绩状态逐一吻合
+    unknown = sorted(
+        (set(active_in) | set(pending_in)) - set(plan_items)
+    )
+    if unknown:
+        raise BusinessError(
+            f"箱 {', '.join(unknown)} 不在方案 {plan_id} 中，拒绝预测（无效箱项）",
+            422,
+        )
+    wrong_active = sorted(set(active_in) - set(in_progress_nos))
+    wrong_pending = sorted(set(pending_in) - set(pending_nos))
+    missing_active = sorted(set(in_progress_nos) - set(active_in))
+    missing_pending = sorted(set(pending_nos) - set(pending_in))
+    if wrong_active or wrong_pending or missing_active or missing_pending:
+        problems = []
+        if missing_active:
+            problems.append(f"缺少进行中箱项：{', '.join(missing_active)}")
+        if missing_pending:
+            problems.append(f"缺少待开工箱项：{', '.join(missing_pending)}")
+        if wrong_active:
+            problems.append(
+                f"进行中箱项与实绩状态不符（非进行中箱）：{', '.join(wrong_active)}"
+            )
+        if wrong_pending:
+            problems.append(
+                f"待开工箱项与实绩状态不符（非待开工箱）：{', '.join(wrong_pending)}"
+            )
+        raise BusinessError(
+            "箱项须恰好覆盖截至分钟的全部未完箱（" + "；".join(problems) + "）",
+            422,
+        )
+
+    # 停机区间：桥号须在冻结基线范围内（起点<终点已由 schema 校验，
+    # 非负亦由 schema 校验）
+    bad_cranes = sorted(
+        {d.crane_no for d in payload.crane_downtimes
+         if not 1 <= d.crane_no <= crane_count}
+    )
+    if bad_cranes:
+        raise BusinessError(
+            f"停机岸桥编号 {', '.join(map(str, bad_cranes))} 超出冻结基线岸桥数量 "
+            f"{crane_count}（合法编号 1..{crane_count}），拒绝预测",
+            422,
+        )
+
+    active_jobs = []
+    for no in in_progress_nos:
+        b = boxes[no]
+        active_jobs.append(ActiveJob(
+            no=no,
+            stack=b.stack,
+            tier=b.tier,
+            crane_no=b.crane_no,
+            remaining=active_in[no].remaining_duration,
+        ))
+
+    pending_jobs = []
+    for no in pending_nos:
+        item = plan_items[no]
+        e = pending_in[no]
+        pending_jobs.append(PendingJob(
+            no=no,
+            stack=item.stack,
+            tier=item.tier,
+            duration=e.duration,
+            release=e.release_minute,
+            deadline=e.deadline_minute,
+        ))
+
+    downtimes = [
+        Downtime(
+            crane_no=d.crane_no,
+            start_minute=d.start_minute,
+            end_minute=d.end_minute,
+        )
+        for d in payload.crane_downtimes
+    ]
+
+    try:
+        result = solve_forecast(
+            pending=pending_jobs,
+            active=active_jobs,
+            downtimes=downtimes,
+            crane_count=crane_count,
+            cutoff=cutoff,
+        )
+    except InfeasibleForecast as exc:
+        raise BusinessError(f"无可行剩余作业安排：{exc.reason}；本次预测不保存", 422)
+
+    # 无未完箱时，全船最晚完工即已完工箱的实际最晚完工（无箱则为 0）
+    latest = result.latest_finish_minute
+    if not result.entries:
+        latest = max(finished_finish.values(), default=0)
+
+    return {
+        "plan_id": plan_id,
+        "revision_no": plan.revision_no,
+        "actual_version": actuals.version,
+        "cutoff_minute": cutoff,
+        "baseline_crane_count": crane_count,
+        "crane_downtimes": [
+            {"crane_no": d.crane_no, "start_minute": d.start_minute,
+             "end_minute": d.end_minute}
+            for d in sorted(
+                payload.crane_downtimes,
+                key=lambda d: (d.crane_no, d.start_minute, d.end_minute),
+            )
+        ],
+        "entries": [
+            {
+                "container_no": e.container_no,
+                "stack": e.stack,
+                "tier": e.tier,
+                "kind": e.kind,
+                "start_minute": e.start_minute,
+                "finish_minute": e.finish_minute,
+                "crane_no": e.crane_no,
+            }
+            for e in result.entries
+        ],
+        "latest_finish_minute": latest,
+    }
 
 
 # ---------- 装船完结交接（不可变凭证） ----------

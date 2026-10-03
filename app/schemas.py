@@ -608,6 +608,135 @@ class ActualsOut(BaseModel):
     created_at: str
 
 
+# ---------- 岸桥停机：剩余作业预测（只读，不落库） ----------
+
+
+class ForecastActiveEntryIn(BaseModel):
+    """进行中箱（实绩状态为已开工未完工）：正整数预计剩余时长。"""
+
+    container_no: str = Field(..., description="箱号（须为截至时刻的进行中箱）")
+    remaining_duration: int = Field(
+        ..., gt=0, description="预计剩余作业时长（正整数分钟），自截至分钟连续作业"
+    )
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+
+class ForecastPendingEntryIn(BaseModel):
+    """待开工箱（实绩状态为未开工）：时长与自身时间窗。"""
+
+    container_no: str = Field(..., description="箱号（须为截至时刻的待开工箱）")
+    duration: int = Field(..., gt=0, description="该箱剩余吊装时长（正整数分钟）")
+    release_minute: int = Field(..., ge=0, description="最早开工分钟（非负整数）")
+    deadline_minute: int = Field(
+        ..., ge=0, description="最迟完工分钟（非负整数，可恰在此时刻结束）"
+    )
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+    @model_validator(mode="after")
+    def _window(self) -> "ForecastPendingEntryIn":
+        if self.release_minute > self.deadline_minute:
+            raise ValueError(
+                f"箱 {self.container_no} 的最早开工 {self.release_minute} 不得晚于"
+                f"最迟完工 {self.deadline_minute}（时间窗倒置）"
+            )
+        return self
+
+
+class ForecastDowntimeIn(BaseModel):
+    """冻结基线岸桥的停机半开区间 [start_minute, end_minute)。"""
+
+    crane_no: int = Field(
+        ..., ge=1, description="岸桥编号（正整数，须在冻结基线岸桥数量内）"
+    )
+    start_minute: int = Field(..., ge=0, description="停机起始分钟（非负整数）")
+    end_minute: int = Field(..., ge=0, description="停机结束分钟（非负整数，不含）")
+
+    @model_validator(mode="after")
+    def _half_open(self) -> "ForecastDowntimeIn":
+        if self.start_minute >= self.end_minute:
+            raise ValueError(
+                f"岸桥 {self.crane_no} 的停机起点 {self.start_minute} 必须严格早于"
+                f"停机终点 {self.end_minute}（半开区间，起点不早于终点即拒绝）"
+            )
+        return self
+
+
+class RemainingForecastIn(BaseModel):
+    """岸桥停机时按已确认实绩预测剩余作业的请求（纯只读，不保存）。"""
+
+    expected_actual_version: int = Field(
+        ..., ge=1, description="期望实绩版本；与当前版本不一致返回 409"
+    )
+    cutoff_minute: int = Field(
+        ..., ge=0, description="截至分钟（非负整数）；实绩事件不得晚于该分钟"
+    )
+    in_progress: list[ForecastActiveEntryIn] = Field(
+        default_factory=list, description="各进行中箱的正整数预计剩余时长"
+    )
+    pending: list[ForecastPendingEntryIn] = Field(
+        default_factory=list,
+        description="待开工箱的正整数时长及非负最早开工/最迟完工分钟",
+    )
+    crane_downtimes: list[ForecastDowntimeIn] = Field(
+        default_factory=list,
+        description="冻结基线岸桥编号对应的非负起止分钟停机半开区间",
+    )
+
+    @model_validator(mode="after")
+    def _unique(self) -> "RemainingForecastIn":
+        active_nos = [e.container_no for e in self.in_progress]
+        if len(set(active_nos)) != len(active_nos):
+            dup = sorted({n for n in active_nos if active_nos.count(n) > 1})
+            raise ValueError(f"进行中箱号重复提交：{', '.join(dup)}")
+        pending_nos = [e.container_no for e in self.pending]
+        if len(set(pending_nos)) != len(pending_nos):
+            dup = sorted({n for n in pending_nos if pending_nos.count(n) > 1})
+            raise ValueError(f"待开工箱号重复提交：{', '.join(dup)}")
+        overlap = sorted(set(active_nos) & set(pending_nos))
+        if overlap:
+            raise ValueError(
+                f"箱 {', '.join(overlap)} 同时出现在进行中与待开工箱项中"
+            )
+        return self
+
+
+class ForecastEntryOut(BaseModel):
+    container_no: str
+    stack: str
+    tier: int
+    kind: str = Field(
+        ..., description="in_progress=进行中箱（自截至分钟连续作业）；pending=待开工箱"
+    )
+    start_minute: int = Field(..., description="预计开工分钟（进行中箱即截至分钟）")
+    finish_minute: int = Field(..., description="预计完工分钟")
+    crane_no: int = Field(..., description="预计作业岸桥（进行中箱保持实际岸桥）")
+
+
+class RemainingForecastOut(BaseModel):
+    plan_id: str
+    revision_no: int = Field(..., description="当前方案修订号")
+    actual_version: int = Field(..., description="预测所依据的实绩版本")
+    cutoff_minute: int
+    baseline_crane_count: int = Field(..., description="冻结基线岸桥数量")
+    crane_downtimes: list[ForecastDowntimeIn] = Field(
+        ..., description="本次采用的停机半开区间（按岸桥、起点升序）"
+    )
+    entries: list[ForecastEntryOut] = Field(
+        ..., description="未完箱逐箱预计开工/完工分钟与岸桥（按箱号升序）"
+    )
+    latest_finish_minute: int = Field(
+        ..., description="全船预计最晚完工分钟（无未完箱时为已完工箱实际最晚完工）"
+    )
+
+
 # ---------- 装船完结交接（不可变凭证） ----------
 
 
