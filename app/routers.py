@@ -21,6 +21,8 @@ from app.schemas import (
     PlanComputeIn,
     PlanConfirmIn,
     PlanOut,
+    RemainingForecastIn,
+    RemainingForecastOut,
     RestowCreateIn,
     RestowMoveOut,
     RestowOut,
@@ -466,6 +468,22 @@ def correct_actual_event(
 def get_actuals(plan_id: str, db: Session = Depends(get_db)):
     actuals = services.get_actuals(db, plan_id)
     return services.build_actuals_out(db, actuals)
+
+
+# ---------- 岸桥停机剩余作业预测（纯计算，不保存） ----------
+
+
+@router.post(
+    "/plans/{plan_id}/remaining-forecast",
+    response_model=RemainingForecastOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="岸桥停机时按装船实绩预测剩余作业（先全船最晚完工最早，再按箱号字典序；不保存）",
+)
+def forecast_remaining_work(
+    plan_id: str, body: RemainingForecastIn, db: Session = Depends(get_db)
+):
+    return services.forecast_remaining_work(db, plan_id, body)
 
 
 # ---------- 装船完结交接（不可变凭证） ----------
